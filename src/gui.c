@@ -1642,12 +1642,13 @@ void nwipe_gui_prng( void )
     extern nwipe_prng_t nwipe_isaac64;
     extern nwipe_prng_t nwipe_aes_ctr_prng;
     extern nwipe_prng_t nwipe_xoroshiro256_prng;
+    extern nwipe_prng_t nwipe_xorshift128plus_prng;
     extern nwipe_prng_t nwipe_add_lagg_fibonacci_prng;
 
     extern int terminate_signal;
 
     /* The number of implemented PRNGs. */
-    const int count = 5;
+    const int count = 6;
 
     /* The first tabstop. */
     const int tab1 = 2;
@@ -1689,6 +1690,10 @@ void nwipe_gui_prng( void )
     {
         focus = 4;
     }
+    if( nwipe_options.prng == &nwipe_xorshift128plus_prng )
+    {
+        focus = 5;
+    }
     do
     {
         /* Clear the main window. */
@@ -1705,6 +1710,7 @@ void nwipe_gui_prng( void )
         mvwprintw( main_window, yy++, tab1, "  %s", nwipe_isaac64.label );
         mvwprintw( main_window, yy++, tab1, "  %s", nwipe_add_lagg_fibonacci_prng.label );
         mvwprintw( main_window, yy++, tab1, "  %s", nwipe_xoroshiro256_prng.label );
+        mvwprintw( main_window, yy++, tab1, "  %s", nwipe_xorshift128plus_prng.label );
         yy++;
 
         /* Print the cursor. */
@@ -1879,6 +1885,22 @@ void nwipe_gui_prng( void )
                            tab1,
                            "especially for legacy systems, due to its efficiency and minimal demands.  " );
                 break;
+            case 5:
+                mvwprintw( main_window,
+                           yy++,
+                           tab1,
+                           "Xorshift128+, a modern evolution of xorshift algorithms, employs a 128-bit" );
+                mvwprintw( main_window,
+                           yy++,
+                           tab1,
+                           "internal state (2 x 64-bit) to achieve an ultra-long period of 2^128-1, ensuring" );
+                mvwprintw( main_window,
+                           yy++,
+                           tab1,
+                           "a vast non-repeating sequence of pseudo-random numbers. Its design focuses" );
+                mvwprintw(
+                    main_window, yy++, tab1, "on high-throughput generation with minimal computational overhead." );
+                break;
         }
 
         /* switch */
@@ -1949,6 +1971,11 @@ void nwipe_gui_prng( void )
                 {
                     nwipe_options.prng = &nwipe_xoroshiro256_prng;
                 }
+                if( focus == 5 )
+                {
+                    nwipe_options.prng = &nwipe_xorshift128plus_prng;
+                }
+
                 return;
 
             case KEY_BACKSPACE:
