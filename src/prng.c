@@ -42,7 +42,7 @@ nwipe_prng_t nwipe_add_lagg_fibonacci_prng = { "Lagged Fibonacci generator",
 nwipe_prng_t nwipe_xoroshiro256_prng = { "XORoshiro-256", nwipe_xoroshiro256_prng_init, nwipe_xoroshiro256_prng_read };
 
 /* AES-CTR-NI PRNG Structure */
-nwipe_prng_t nwipe_aes_ctr_prng = { "AES-256-CTR", nwipe_aes_ctr_prng_init, nwipe_aes_ctr_prng_read };
+nwipe_prng_t nwipe_aes_ctr_prng = { "AES-256-CTR (mod. 4p/10r)", nwipe_aes_ctr_prng_init, nwipe_aes_ctr_prng_read };
 
 /* Print given number of bytes from unsigned integer number to a byte stream buffer starting with low-endian. */
 static inline void u32_to_buffer( u8* restrict buffer, u32 val, const int len )
@@ -347,7 +347,7 @@ int nwipe_xoroshiro256_prng_read( NWIPE_PRNG_READ_SIGNATURE )
 }
 
 /**
- * Initializes the AES-256-CTR PRNG using OpenSSL and validates its output.
+ * Initializes the AES-256-CTR modified PRNG.
  *
  * @param state A double pointer to the PRNG state structure. If the pointed state is NULL,
  *        memory will be allocated and initialized for it.
@@ -405,7 +405,7 @@ int nwipe_aes_ctr_prng_read( NWIPE_PRNG_READ_SIGNATURE )
         // Generate a 256-bit block and write it directly to the buffer.
         if( aes_ctr_prng_genrand_uint256_to_buf( (aes_ctr_state_t*) *state, bufpos ) != 0 )
         {
-            nwipe_log( NWIPE_LOG_ERROR, "Error occurred during RNG generation in OpenSSL." );
+            nwipe_log( NWIPE_LOG_ERROR, "Error occurred during RNG generation." );
             return -1;
         }
 
@@ -426,7 +426,7 @@ int nwipe_aes_ctr_prng_read( NWIPE_PRNG_READ_SIGNATURE )
         // Generate one more block of random data.
         if( aes_ctr_prng_genrand_uint256_to_buf( (aes_ctr_state_t*) *state, temp_output ) != 0 )
         {
-            nwipe_log( NWIPE_LOG_ERROR, "Error occurred during RNG generation in OpenSSL." );
+            nwipe_log( NWIPE_LOG_ERROR, "Error occurred during RNG generation." );
             return -1;
         }
 
