@@ -403,7 +403,7 @@ int nwipe_aes_ctr_prng_read( NWIPE_PRNG_READ_SIGNATURE )
     for( size_t ii = 0; ii < words; ++ii )
     {
         // Generate a 256-bit block and write it directly to the buffer.
-        if( aes_ctr_prng_genrand_uint256_to_buf( (aes_ctr_state_t*) *state, bufpos ) != 0 )
+        if( aes_ctr_prng_genrand_16k_to_buf( (aes_ctr_state_t*) *state, bufpos ) != 0 )
         {
             nwipe_log( NWIPE_LOG_ERROR, "Error occurred during RNG generation in OpenSSL." );
             return -1;
@@ -424,7 +424,7 @@ int nwipe_aes_ctr_prng_read( NWIPE_PRNG_READ_SIGNATURE )
         memset( temp_output, 0, sizeof( temp_output ) );
 
         // Generate one more block of random data.
-        if( aes_ctr_prng_genrand_uint256_to_buf( (aes_ctr_state_t*) *state, temp_output ) != 0 )
+        if( aes_ctr_prng_genrand_16k_to_buf( (aes_ctr_state_t*) *state, temp_output ) != 0 )
         {
             nwipe_log( NWIPE_LOG_ERROR, "Error occurred during RNG generation in OpenSSL." );
             return -1;

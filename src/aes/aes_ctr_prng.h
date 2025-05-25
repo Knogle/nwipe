@@ -21,8 +21,10 @@ int aes_ctr_prng_init(aes_ctr_state_t *state,
                       unsigned long    key_length);
 
 /* Generate one 256-bit random value and write it to bufpos (32 bytes) */
-int aes_ctr_prng_genrand_uint256_to_buf(aes_ctr_state_t *state,
+int aes_ctr_prng_genrand_16k_to_buf(aes_ctr_state_t *state,
                                         unsigned char   *bufpos);
+
+
 
 #ifdef __cplusplus
 } /* extern "C" */
