@@ -47,6 +47,9 @@
 #include "options.h"
 #include "pass.h"
 #include "logging.h"
+#include <errno.h>
+#include <unistd.h>
+#include <stddef.h>
 
 /*
  * Comment Legend
@@ -57,6 +60,98 @@
  *   "rounds"  The number of times that a method will be applied to a device.
  *
  */
+
+/* Debug-Schalter: auf 0 setzen, wenn du die Seed-Ausgabe nicht mehr willst. */
+#define NWIPE_DEBUG_SEED 1
+
+/**
+ * @brief Debug-Ausgabe des PRNG-Seeds (erste paar Bytes als Hexwerte).
+ *
+ * Gibt zur Sicherheit nur maximal die ersten 8 Bytes aus, damit das Log
+ * nicht explodiert. Wenn NWIPE_DEBUG_SEED == 0, ist diese Funktion ein No-Op.
+ */
+static void nwipe_debug_seed( const void *buf, size_t len, const char *label )
+{
+#if NWIPE_DEBUG_SEED
+    const uint8_t *b = buf;
+    size_t n = (len < 8) ? len : 8;
+
+    nwipe_log( NWIPE_LOG_NOTICE,
+               "PRNG seed (%s, first %zu bytes of %zu): "
+               "%02X %02X %02X %02X %02X %02X %02X %02X",
+               label ? label : "no-label",
+               n,
+               len,
+               (n > 0) ? b[0] : 0,
+               (n > 1) ? b[1] : 0,
+               (n > 2) ? b[2] : 0,
+               (n > 3) ? b[3] : 0,
+               (n > 4) ? b[4] : 0,
+               (n > 5) ? b[5] : 0,
+               (n > 6) ? b[6] : 0,
+               (n > 7) ? b[7] : 0 );
+#else
+    (void)buf;
+    (void)len;
+    (void)label;
+#endif
+}
+
+
+/* Fill a buffer with len bytes of entropy from fd, in chunks of <= 128 bytes. */
+#define NWIPE_ENTROPY_MAX_CHUNK 32
+
+static int nwipe_entropy_fill( int fd, void *buf, size_t len )
+{
+    uint8_t *p = buf;
+    size_t left = len;
+
+    while( left > 0 )
+    {
+        size_t chunk = left;
+        if( chunk > NWIPE_ENTROPY_MAX_CHUNK )
+            chunk = NWIPE_ENTROPY_MAX_CHUNK;
+
+        ssize_t r = read( fd, p, chunk );
+        if( r < 0 )
+        {
+            int err = errno;
+
+            if( err == EINTR )
+                continue;   /* bei Signal einfach nochmal probieren */
+
+#if NWIPE_DEBUG_SEED
+            nwipe_log( NWIPE_LOG_ERROR,
+                       "nwipe_entropy_fill: read(fd=%d, chunk=%zu, "
+                       "left=%zu) failed: errno=%d",
+                       fd,
+                       (size_t) chunk,
+                       left,
+                       err );
+#endif
+            errno = err;
+            return -1;      /* echter Fehler */
+        }
+
+        if( r == 0 )
+        {
+#if NWIPE_DEBUG_SEED
+            nwipe_log( NWIPE_LOG_ERROR,
+                       "nwipe_entropy_fill: read(fd=%d, chunk=%zu) "
+                       "returned 0 (unexpected EOF on RNG)",
+                       fd,
+                       (size_t) chunk );
+#endif
+            errno = EIO;
+            return -1;
+        }
+
+        left -= (size_t) r;
+        p    += (size_t) r;
+    }
+
+    return 0;
+}
 
 const char* nwipe_dod522022m_label = "DoD 5220.22-M";
 const char* nwipe_dodshort_label = "DoD Short";
@@ -840,59 +935,153 @@ void* nwipe_bmb( void* ptr )
     return NULL;
 }
 
+/**
+ * @brief Execute the selected wipe method on a single device.
+ *
+ * This function drives the entire wipe workflow for one device:
+ *
+ *  - It interprets the @p patterns array as a sequence of "passes" that
+ *    must be executed in each "round" (e.g. DoD 5220.22-M has 7 passes
+ *    per round, PRNG Stream has 1 pass per round, etc.).
+ *  - For each pass/round combination it either:
+ *      - writes a static pattern (all-zeros, all-ones, specific byte),
+ *      - or writes a pseudo-random pattern via the configured PRNG.
+ *  - Optionally it verifies written data depending on global options
+ *    (verify-all, verify-last, verify-only).
+ *
+ * Semantics of the patterns array:
+ *  - patterns[i].length > 0  →  static pattern pass (pattern data in patterns[i].pattern)
+ *  - patterns[i].length < 0  →  random pattern pass (PRNG is used)
+ *  - patterns[i].length == 0 →  terminator; marks end of the array
+ *
+ * PRNG seeding:
+ *  - For every random pass, the PRNG state buffer (c->prng_seed) is filled
+ *    with NWIPE_KNOB_PRNG_STATE_LENGTH bytes of entropy using c->entropy_fd.
+ *  - c->entropy_fd is backed by an AF_ALG kernel RNG (type "rng", name
+ *    "stdrng" or similar) in the current configuration.
+ *  - nwipe_entropy_fill() abstracts the AF_ALG constraint that at most
+ *    128 bytes can be read per system call by looping until the full
+ *    seed buffer has been filled.
+ *
+ * Return codes:
+ *  -  0  → Completed successfully, no non-fatal errors.
+ *  -  1  → Completed, but with non-fatal write and/or verify errors
+ *          (e.g. bad sectors, mismatched verification).
+ *  - -1  → Fatal error (allocation failure, I/O error, PRNG seeding
+ *          failure, etc.). The caller should treat this as "wipe failed".
+ *
+ * @param c         Device-specific context for this worker. Contains the
+ *                  device file descriptor, device size, PRNG handles,
+ *                  counters, error statistics, etc.
+ * @param patterns  Null-terminated array of nwipe_pattern_t describing
+ *                  the logical sequence of passes that constitute one round.
+ *
+ * @return 0 on success, 1 on non-fatal errors, -1 on fatal error.
+ */
+
+/**
+ * @brief Execute the selected wipe method on a single device.
+ *
+ * This function drives the entire wipe workflow for one device:
+ *
+ *  - It interprets the @p patterns array as a sequence of "passes" that
+ *    must be executed in each "round" (e.g. DoD 5220.22-M has 7 passes
+ *    per round, PRNG Stream has 1 pass per round, etc.).
+ *  - For each pass/round combination it either:
+ *      - writes a static pattern (all-zeros, all-ones, specific byte),
+ *      - or writes a pseudo-random pattern via the configured PRNG.
+ *  - Optionally it verifies written data depending on global options
+ *    (verify-all, verify-last, verify-only).
+ *
+ * Semantics of the patterns array:
+ *  - patterns[i].length > 0  →  static pattern pass
+ *  - patterns[i].length < 0  →  random pattern pass (PRNG is used)
+ *  - patterns[i].length == 0 →  terminator; marks end of the array
+ *
+ * PRNG seeding:
+ *  - For every random pass, the PRNG state buffer (c->prng_seed) is filled
+ *    with NWIPE_KNOB_PRNG_STATE_LENGTH bytes of entropy using c->entropy_fd.
+ *  - c->entropy_fd ist bei dir ein AF_ALG RNG (type "rng", name "stdrng").
+ *  - nwipe_entropy_fill() looped intern in <= 128-Byte-Chunks, um das
+ *    AF_ALG-Limit pro read(2) einzuhalten.
+ *
+ * Return codes:
+ *  -  0  → Completed successfully, no non-fatal errors.
+ *  -  1  → Completed, but with non-fatal write and/or verify errors.
+ *  - -1  → Fatal error (allocation failure, I/O error, PRNG seeding failure).
+ */
 int nwipe_runmethod( nwipe_context_t* c, nwipe_pattern_t* patterns )
 {
-    /**
-     * Writes patterns to the device.
-     *
-     */
-
-    /* The result holder. */
+    /* Result code from helper calls (pass/verify/PRNG, etc.). */
     int r;
 
-    /* An index variable. */
+    /* Generic index variable for iterating the patterns array. */
     int i = 0;
 
-    /* Variable to track if it is the last pass */
+    /**
+     * Flag indicating whether the current pass is the "last pass that
+     * should be verified" according to the chosen verification policy.
+     *
+     * This is only used when NWIPE_VERIFY_LAST is active and the method
+     * is not OPS-II, because OPS-II has its own "final random pattern"
+     * (FRP) semantics handled later.
+     */
     int lastpass = 0;
 
-    i = 0;
+    /* The zero-fill pattern for final blanking or zero-verification. */
+    nwipe_pattern_t pattern_zero = (nwipe_pattern_t){ 1, "\x00" };
 
-    /* The zero-fill pattern for the final pass of most methods. */
-    nwipe_pattern_t pattern_zero = { 1, "\x00" };
+    /* The one-fill pattern for "all ones" verification. */
+    nwipe_pattern_t pattern_one  = (nwipe_pattern_t){ 1, "\xFF" };
 
-    /* The one-fill pattern for verification of the ones fill */
-    nwipe_pattern_t pattern_one = { 1, "\xFF" };
-
-    /* Create the PRNG state buffer. */
+    /**
+     * Allocate the PRNG seed buffer for this context. Each random pass
+     * will re-fill this buffer with fresh entropy and re-seed the PRNG.
+     */
     c->prng_seed.length = NWIPE_KNOB_PRNG_STATE_LENGTH;
-    c->prng_seed.s = malloc( c->prng_seed.length );
+    c->prng_seed.s      = malloc( c->prng_seed.length );
 
-    /* Check the memory allocation. */
     if( !c->prng_seed.s )
     {
         nwipe_perror( errno, __FUNCTION__, "malloc" );
-        nwipe_log( NWIPE_LOG_FATAL, "Unable to allocate memory for the prng seed buffer." );
+        nwipe_log( NWIPE_LOG_FATAL,
+                   "Unable to allocate memory for the PRNG seed buffer." );
         return -1;
     }
 
-    /* Count the number of patterns in the array. */
+    /**
+     * Determine how many logical passes the current method defines by
+     * scanning the patterns array until the terminator (length == 0).
+     */
+    i = 0;
     while( patterns[i].length )
     {
         i += 1;
     }
 
-    /* Tell the parent the number of device passes that will be run in one round. */
+    /* Inform the context how many passes we have per round. */
     c->pass_count = i;
 
-    /* Set the number of bytes that will be written across all passes in one round. */
+    /**
+     * Compute the total number of bytes written in a single round,
+     * assuming all passes write the full device.
+     */
     c->pass_size = c->pass_count * c->device_size;
 
-    /* For the selected method, calculate the correct round_size value (for correct percentage calculation) */
+    /**
+     * Compute round_size for progress reporting. This accounts for
+     * methods that may modify how much actual data is written per
+     * pass/round combination.
+     */
     calculate_round_size( c );
 
-    /* If only verifying then the round size is the device size */
-    if( nwipe_options.method == &nwipe_verify_zero || nwipe_options.method == &nwipe_verify_one )
+    /**
+     * For pure verification methods, the "round" concept essentially
+     * collapses to "verify the device once", so the round size is
+     * just the device size.
+     */
+    if( nwipe_options.method == &nwipe_verify_zero ||
+        nwipe_options.method == &nwipe_verify_one )
     {
         c->round_size = c->device_size;
     }
@@ -900,30 +1089,50 @@ int nwipe_runmethod( nwipe_context_t* c, nwipe_pattern_t* patterns )
     /* Initialize the working round counter. */
     c->round_working = 0;
 
-    nwipe_log(
-        NWIPE_LOG_NOTICE, "Invoking method '%s' on %s", nwipe_method_label( nwipe_options.method ), c->device_name );
+    nwipe_log( NWIPE_LOG_NOTICE,
+               "Invoking method '%s' on %s",
+               nwipe_method_label( nwipe_options.method ),
+               c->device_name );
 
+    /**
+     * Outer loop over all rounds. Most methods will have round_count = 1,
+     * but some (e.g. multi-round custom methods) may configure more.
+     */
     while( c->round_working < c->round_count )
     {
-        /* Increment the round counter. */
+        /* Advance to the next round. */
         c->round_working += 1;
 
-        nwipe_log(
-            NWIPE_LOG_NOTICE, "Starting round %i of %i on %s", c->round_working, c->round_count, c->device_name );
+        nwipe_log( NWIPE_LOG_NOTICE,
+                   "Starting round %i of %i on %s",
+                   c->round_working,
+                   c->round_count,
+                   c->device_name );
 
-        /* Initialize the working pass counter. */
+        /* Reset the "current pass within this round" counter. */
         c->pass_working = 0;
 
+        /**
+         * Inner loop over all passes defined by the method. Each element
+         * of the patterns[] array corresponds to a logical pass.
+         */
         for( i = 0; i < c->pass_count; i++ )
         {
-            /* Increment the working pass. */
+            /* Advance the currently active pass index (1-based). */
             c->pass_working += 1;
 
-            /* Check if this is the last pass. */
-            if( nwipe_options.verify == NWIPE_VERIFY_LAST && nwipe_options.method != &nwipe_ops2 )
+            /**
+             * Determine whether this pass should be treated as the
+             * "last pass" for verification purposes when the user
+             * requested NWIPE_VERIFY_LAST. OPS-II is excluded here
+             * because it has its own FRP logic later.
+             */
+            if( nwipe_options.verify == NWIPE_VERIFY_LAST &&
+                nwipe_options.method != &nwipe_ops2 )
             {
-                if( nwipe_options.noblank == 1 && c->round_working == c->round_count
-                    && c->pass_working == c->pass_count )
+                if( nwipe_options.noblank == 1 &&
+                    c->round_working == c->round_count &&
+                    c->pass_working  == c->pass_count )
                 {
                     lastpass = 1;
                 }
@@ -937,33 +1146,56 @@ int nwipe_runmethod( nwipe_context_t* c, nwipe_pattern_t* patterns )
                        c->round_count,
                        c->device_name );
 
+            /**
+             * Sanity check: the pass descriptor at index i must never
+             * have length == 0 here, because that marks the terminator
+             * of the patterns array and is not a real pass.
+             */
             if( patterns[i].length == 0 )
             {
-                /* Caught insanity. */
-                nwipe_log( NWIPE_LOG_SANITY, "nwipe_runmethod: A non-terminating pattern element has zero length." );
+                nwipe_log( NWIPE_LOG_SANITY,
+                           "nwipe_runmethod: A non-terminating pattern "
+                           "element has zero length." );
+                free( c->prng_seed.s );
+                c->prng_seed.s = NULL;
                 return -1;
             }
 
+            /**
+             * CASE 1: Static pattern pass
+             *
+             * length > 0  → patterns[i].pattern points to a single byte
+             *                which will be replicated over the device.
+             */
             if( patterns[i].length > 0 )
             {
-
-                /* Write a static pass. */
+                /* Perform the write pass using a fixed pattern. */
                 c->pass_type = NWIPE_PASS_WRITE;
                 r = nwipe_static_pass( c, &patterns[i] );
                 c->pass_type = NWIPE_PASS_NONE;
 
-                /* Log number of bytes written to disk */
-                nwipe_log( NWIPE_LOG_NOTICE, "%llu bytes written to %s", c->pass_done, c->device_name );
+                /* Report the number of bytes written. */
+                nwipe_log( NWIPE_LOG_NOTICE,
+                           "%llu bytes written to %s",
+                           c->pass_done,
+                           c->device_name );
 
-                /* Check for a fatal error. */
+                /* Abort on fatal write error. */
                 if( r < 0 )
                 {
+                    free( c->prng_seed.s );
+                    c->prng_seed.s = NULL;
                     return r;
                 }
 
-                if( nwipe_options.verify == NWIPE_VERIFY_ALL || lastpass == 1 )
+                /**
+                 * Verification for static passes:
+                 *  - verify-all: every pass is verified,
+                 *  - verify-last: nur die letzte (effektive) wird verifiziert.
+                 */
+                if( nwipe_options.verify == NWIPE_VERIFY_ALL ||
+                    lastpass == 1 )
                 {
-
                     nwipe_log( NWIPE_LOG_NOTICE,
                                "Verifying pass %i of %i, round %i of %i, on %s",
                                c->pass_working,
@@ -972,16 +1204,19 @@ int nwipe_runmethod( nwipe_context_t* c, nwipe_pattern_t* patterns )
                                c->round_count,
                                c->device_name );
 
-                    /* Verify this pass. */
                     c->pass_type = NWIPE_PASS_VERIFY;
                     r = nwipe_static_verify( c, &patterns[i] );
                     c->pass_type = NWIPE_PASS_NONE;
 
-                    nwipe_log( NWIPE_LOG_NOTICE, "%llu bytes read from %s", c->pass_done, c->device_name );
+                    nwipe_log( NWIPE_LOG_NOTICE,
+                               "%llu bytes read from %s",
+                               c->pass_done,
+                               c->device_name );
 
-                    /* Check for a fatal error. */
                     if( r < 0 )
                     {
+                        free( c->prng_seed.s );
+                        c->prng_seed.s = NULL;
                         return r;
                     }
 
@@ -993,50 +1228,99 @@ int nwipe_runmethod( nwipe_context_t* c, nwipe_pattern_t* patterns )
                                c->round_count,
                                c->device_name );
                 }
-
-            } /* static pass */
-
+            }
+            /**
+             * CASE 2: Random pattern pass
+             *
+             * length < 0  → A PRNG stream is used to generate data for
+             *                this pass. patterns[i].pattern is ignored.
+             */
             else
             {
                 c->pass_type = NWIPE_PASS_WRITE;
 
-                /* Seed the PRNG. */
-                r = read( c->entropy_fd, c->prng_seed.s, c->prng_seed.length );
-
-                /* Check the result. */
-                if( r < 0 )
+                /**
+                 * Seed the PRNG for this random pass.
+                 *
+                 * We fill c->prng_seed.s with NWIPE_KNOB_PRNG_STATE_LENGTH
+                 * bytes of entropy. nwipe_entropy_fill() abstracts away
+                 * the AF_ALG RNG limitation of 128 bytes per read(2), and
+                 * will loop until the entire buffer has been filled or
+                 * a fatal error occurs.
+                 */
+                if( nwipe_entropy_fill( c->entropy_fd,
+                                        c->prng_seed.s,
+                                        c->prng_seed.length ) < 0 )
                 {
                     c->pass_type = NWIPE_PASS_NONE;
                     nwipe_perror( errno, __FUNCTION__, "read" );
-                    nwipe_log( NWIPE_LOG_FATAL, "Unable to seed the PRNG." );
+                    nwipe_log( NWIPE_LOG_FATAL,
+                               "Unable to seed the PRNG." );
+                    free( c->prng_seed.s );
+                    c->prng_seed.s = NULL;
                     return -1;
                 }
 
-                /* Check for a partial read. */
-                if( r != c->prng_seed.length )
+#if NWIPE_DEBUG_SEED
+                /* Debug: ersten paar Bytes des Seeds loggen */
                 {
-                    /* TODO: Handle partial reads. */
-                    nwipe_log( NWIPE_LOG_FATAL, "Insufficient entropy is available." );
-                    return -1;
-                }
+                    size_t dump = c->prng_seed.length < 16
+                                  ? c->prng_seed.length
+                                  : 16;
+                    char hex[16 * 3 + 1];
+                    size_t pos = 0;
+                    const unsigned char *b =
+                        (const unsigned char *) c->prng_seed.s;
 
-                /* Write the random pass. */
+                    for( size_t k = 0;
+                         k < dump && pos < sizeof( hex ) - 1;
+                         ++k )
+                    {
+                        int w = snprintf( &hex[pos],
+                                          sizeof( hex ) - pos,
+                                          "%02X ",
+                                          b[k] );
+                        if( w <= 0 )
+                            break;
+                        pos += (size_t) w;
+                    }
+                    hex[pos] = '\0';
+
+                    nwipe_log( NWIPE_LOG_NOTICE,
+                               "PRNG seed (random pass, first %zu of %zu bytes): %s",
+                               dump,
+                               c->prng_seed.length,
+                               hex );
+                }
+#endif
+
+                /* Perform the pseudo-random write pass. */
                 r = nwipe_random_pass( c );
                 c->pass_type = NWIPE_PASS_NONE;
 
-                /* Log number of bytes written to disk */
-                nwipe_log( NWIPE_LOG_NOTICE, "%llu bytes written to %s", c->pass_done, c->device_name );
+                nwipe_log( NWIPE_LOG_NOTICE,
+                           "%llu bytes written to %s",
+                           c->pass_done,
+                           c->device_name );
 
-                /* Check for a fatal error. */
+                /* Abort on fatal write error. */
                 if( r < 0 )
                 {
+                    free( c->prng_seed.s );
+                    c->prng_seed.s = NULL;
                     return r;
                 }
 
-                /* Make sure IS5 enhanced always verifies its PRNG pass regardless */
-                /* of the current combination of the --noblank (which influences   */
-                /* the lastpass variable) and --verify options.                    */
-                if( nwipe_options.verify == NWIPE_VERIFY_ALL || lastpass == 1 || nwipe_options.method == &nwipe_is5enh )
+                /**
+                 * Verification policy for random passes:
+                 *
+                 *  - verify-all:     always verify,
+                 *  - verify-last:    verify only the last pass,
+                 *  - IS5 enhanced:   always verify the PRNG pass.
+                 */
+                if( nwipe_options.verify == NWIPE_VERIFY_ALL ||
+                    lastpass == 1 ||
+                    nwipe_options.method == &nwipe_is5enh )
                 {
                     nwipe_log( NWIPE_LOG_NOTICE,
                                "Verifying pass %i of %i, round %i of %i, on %s",
@@ -1046,16 +1330,19 @@ int nwipe_runmethod( nwipe_context_t* c, nwipe_pattern_t* patterns )
                                c->round_count,
                                c->device_name );
 
-                    /* Verify this pass. */
                     c->pass_type = NWIPE_PASS_VERIFY;
                     r = nwipe_random_verify( c );
                     c->pass_type = NWIPE_PASS_NONE;
 
-                    nwipe_log( NWIPE_LOG_NOTICE, "%llu bytes read from %s", c->pass_done, c->device_name );
+                    nwipe_log( NWIPE_LOG_NOTICE,
+                               "%llu bytes read from %s",
+                               c->pass_done,
+                               c->device_name );
 
-                    /* Check for a fatal error. */
                     if( r < 0 )
                     {
+                        free( c->prng_seed.s );
+                        c->prng_seed.s = NULL;
                         return r;
                     }
 
@@ -1067,7 +1354,6 @@ int nwipe_runmethod( nwipe_context_t* c, nwipe_pattern_t* patterns )
                                c->round_count,
                                c->device_name );
                 }
-
             } /* random pass */
 
             nwipe_log( NWIPE_LOG_NOTICE,
@@ -1077,13 +1363,15 @@ int nwipe_runmethod( nwipe_context_t* c, nwipe_pattern_t* patterns )
                        c->round_working,
                        c->round_count,
                        c->device_name );
-
         } /* for passes */
 
         if( c->round_working < c->round_count )
         {
-            nwipe_log(
-                NWIPE_LOG_NOTICE, "Finished round %i of %i on %s", c->round_working, c->round_count, c->device_name );
+            nwipe_log( NWIPE_LOG_NOTICE,
+                       "Finished round %i of %i on %s",
+                       c->round_working,
+                       c->round_count,
+                       c->device_name );
         }
         else
         {
@@ -1093,207 +1381,290 @@ int nwipe_runmethod( nwipe_context_t* c, nwipe_pattern_t* patterns )
                        c->round_count,
                        c->device_name );
         }
-
     } /* while rounds */
+
+    /**
+     * Post-round handling for special methods and final blanking/verification.
+     * At this point all "round-based" passes have completed.
+     */
 
     if( nwipe_options.method == &nwipe_ops2 )
     {
-        /* NOTE: The OPS-II method specifically requires that a random pattern be left on the device. */
+        /**
+         * OPS-II requires that a random pattern be left on the device.
+         * This is implemented as a "Final Random Pattern" (FRP) pass,
+         * separate from the round-based pattern sequencing above.
+         */
 
-        /* Tell the parent that we are running the final pass. */
         c->pass_type = NWIPE_PASS_FINAL_OPS2;
 
-        /* Seed the PRNG. */
-        r = read( c->entropy_fd, c->prng_seed.s, c->prng_seed.length );
-
-        /* Check the result. */
-        if( r < 0 )
+        /* Seed the PRNG for the FRP. */
+        if( nwipe_entropy_fill( c->entropy_fd,
+                                c->prng_seed.s,
+                                c->prng_seed.length ) < 0 )
         {
             nwipe_perror( errno, __FUNCTION__, "read" );
-            nwipe_log( NWIPE_LOG_FATAL, "Unable to seed the PRNG." );
+            nwipe_log( NWIPE_LOG_FATAL,
+                       "Unable to seed the PRNG (OPS2 final random pattern)." );
+            free( c->prng_seed.s );
+            c->prng_seed.s = NULL;
             return -1;
         }
 
-        /* Check for a partial read. */
-        if( r != c->prng_seed.length )
+#if NWIPE_DEBUG_SEED
         {
-            /* TODO: Handle partial reads. */
-            nwipe_log( NWIPE_LOG_FATAL, "Insufficient entropy is available." );
-            return -1;
-        }
+            size_t dump = c->prng_seed.length < 16
+                          ? c->prng_seed.length
+                          : 16;
+            char hex[16 * 3 + 1];
+            size_t pos = 0;
+            const unsigned char *b =
+                (const unsigned char *) c->prng_seed.s;
 
-        nwipe_log( NWIPE_LOG_NOTICE, "Writing final random pattern to '%s'.", c->device_name );
+            for( size_t k = 0;
+                 k < dump && pos < sizeof( hex ) - 1;
+                 ++k )
+            {
+                int w = snprintf( &hex[pos],
+                                  sizeof( hex ) - pos,
+                                  "%02X ",
+                                  b[k] );
+                if( w <= 0 )
+                    break;
+                pos += (size_t) w;
+            }
+            hex[pos] = '\0';
+
+            nwipe_log( NWIPE_LOG_NOTICE,
+                       "PRNG seed (OPS2 FRP, first %zu of %zu bytes): %s",
+                       dump,
+                       c->prng_seed.length,
+                       hex );
+        }
+#endif
+
+        nwipe_log( NWIPE_LOG_NOTICE,
+                   "Writing final random pattern to '%s'.",
+                   c->device_name );
 
         /* The final ops2 pass. */
         r = nwipe_random_pass( c );
 
-        nwipe_log( NWIPE_LOG_NOTICE, "%llu bytes written to %s", c->pass_done, c->device_name );
+        nwipe_log( NWIPE_LOG_NOTICE,
+                   "%llu bytes written to %s",
+                   c->pass_done,
+                   c->device_name );
 
-        /* Check for a fatal error. */
         if( r < 0 )
         {
+            free( c->prng_seed.s );
+            c->prng_seed.s = NULL;
             return r;
         }
 
-        if( nwipe_options.verify == NWIPE_VERIFY_LAST || nwipe_options.verify == NWIPE_VERIFY_ALL )
+        if( nwipe_options.verify == NWIPE_VERIFY_LAST ||
+            nwipe_options.verify == NWIPE_VERIFY_ALL )
         {
-            nwipe_log( NWIPE_LOG_NOTICE, "Verifying final random pattern FRP on %s", c->device_name );
+            nwipe_log( NWIPE_LOG_NOTICE,
+                       "Verifying final random pattern FRP on %s",
+                       c->device_name );
 
-            /* Verify the final zero pass. */
             r = nwipe_random_verify( c );
 
-            nwipe_log( NWIPE_LOG_NOTICE, "%llu bytes read from %s", c->pass_done, c->device_name );
+            nwipe_log( NWIPE_LOG_NOTICE,
+                       "%llu bytes read from %s",
+                       c->pass_done,
+                       c->device_name );
 
-            /* Check for a fatal error. */
             if( r < 0 )
             {
+                free( c->prng_seed.s );
+                c->prng_seed.s = NULL;
                 return r;
             }
 
-            nwipe_log( NWIPE_LOG_NOTICE, "[SUCCESS] Verified FRP on '%s' matches", c->device_name );
+            nwipe_log( NWIPE_LOG_NOTICE,
+                       "[SUCCESS] Verified FRP on '%s' matches",
+                       c->device_name );
         }
-
-    } /* final ops2 */
-
+    }
     else if( nwipe_options.method == &nwipe_verify_zero )
     {
-        nwipe_log( NWIPE_LOG_NOTICE, "Verifying that %s is zeroed", c->device_name );
+        /* Verification-only method: confirm that the device is all zeros. */
+        nwipe_log( NWIPE_LOG_NOTICE,
+                   "Verifying that %s is zeroed",
+                   c->device_name );
 
-        /* Verify the final zero pass. */
         c->pass_type = NWIPE_PASS_VERIFY;
         r = nwipe_static_verify( c, &pattern_zero );
         c->pass_type = NWIPE_PASS_NONE;
 
-        /* Check for a fatal error. */
         if( r < 0 )
         {
+            free( c->prng_seed.s );
+            c->prng_seed.s = NULL;
             return r;
         }
+
         if( c->verify_errors == 0 )
         {
-            nwipe_log( NWIPE_LOG_NOTICE, "[SUCCESS] Verified that %s is Zeroed.", c->device_name );
+            nwipe_log( NWIPE_LOG_NOTICE,
+                       "[SUCCESS] Verified that %s is Zeroed.",
+                       c->device_name );
         }
         else
         {
-            nwipe_log( NWIPE_LOG_ERROR, "[FAILURE] %s has not been Zeroed .", c->device_name );
+            nwipe_log( NWIPE_LOG_ERROR,
+                       "[FAILURE] %s has not been Zeroed .",
+                       c->device_name );
         }
-
-    } /* verify */
-
+    }
     else if( nwipe_options.method == &nwipe_verify_one )
     {
-        nwipe_log( NWIPE_LOG_NOTICE, "Verifying that %s is Ones (0xFF)", c->device_name );
+        /* Verification-only method: confirm that the device is all ones. */
+        nwipe_log( NWIPE_LOG_NOTICE,
+                   "Verifying that %s is Ones (0xFF)",
+                   c->device_name );
 
-        /* Verify the final ones pass. */
         c->pass_type = NWIPE_PASS_VERIFY;
         r = nwipe_static_verify( c, &pattern_one );
         c->pass_type = NWIPE_PASS_NONE;
 
-        /* Check for a fatal error. */
         if( r < 0 )
         {
+            free( c->prng_seed.s );
+            c->prng_seed.s = NULL;
             return r;
         }
+
         if( c->verify_errors == 0 )
         {
-            nwipe_log( NWIPE_LOG_NOTICE, "[SUCCESS] Verified that %s is full of ones (0xFF).", c->device_name );
+            nwipe_log( NWIPE_LOG_NOTICE,
+                       "[SUCCESS] Verified that %s is full of ones (0xFF).",
+                       c->device_name );
         }
         else
         {
-            nwipe_log( NWIPE_LOG_ERROR, "[FAILURE] %s is not full of ones (0xFF).", c->device_name );
+            nwipe_log( NWIPE_LOG_ERROR,
+                       "[FAILURE] %s is not full of ones (0xFF).",
+                       c->device_name );
         }
-
-    } /* verify */
-
+    }
     else if( nwipe_options.noblank == 0 )
     {
-        /* Tell the user that we are on the final pass. */
+        /**
+         * Default final blanking pass: if noblank is not set, write a
+         * final all-zero pass and optionally verify it.
+         */
         c->pass_type = NWIPE_PASS_FINAL_BLANK;
 
-        nwipe_log( NWIPE_LOG_NOTICE, "Blanking device %s", c->device_name );
+        nwipe_log( NWIPE_LOG_NOTICE,
+                   "Blanking device %s",
+                   c->device_name );
 
-        /* The final zero pass. */
         r = nwipe_static_pass( c, &pattern_zero );
 
-        /* Log number of bytes written to disk */
-        nwipe_log( NWIPE_LOG_NOTICE, "%llu bytes written to %s", c->pass_done, c->device_name );
+        nwipe_log( NWIPE_LOG_NOTICE,
+                   "%llu bytes written to %s",
+                   c->pass_done,
+                   c->device_name );
 
-        /* Check for a fatal error. */
         if( r < 0 )
         {
+            free( c->prng_seed.s );
+            c->prng_seed.s = NULL;
             return r;
         }
 
-        if( nwipe_options.verify == NWIPE_VERIFY_LAST || nwipe_options.verify == NWIPE_VERIFY_ALL )
+        if( nwipe_options.verify == NWIPE_VERIFY_LAST ||
+            nwipe_options.verify == NWIPE_VERIFY_ALL )
         {
-            nwipe_log( NWIPE_LOG_NOTICE, "Verifying that %s is empty.", c->device_name );
+            nwipe_log( NWIPE_LOG_NOTICE,
+                       "Verifying that %s is empty.",
+                       c->device_name );
 
-            /* Verify the final zero pass. */
             c->pass_type = NWIPE_PASS_VERIFY;
             r = nwipe_static_verify( c, &pattern_zero );
             c->pass_type = NWIPE_PASS_NONE;
 
-            /* Log number of bytes read from disk */
-            nwipe_log( NWIPE_LOG_NOTICE, "%llu bytes read from %s", c->pass_done, c->device_name );
+            nwipe_log( NWIPE_LOG_NOTICE,
+                       "%llu bytes read from %s",
+                       c->pass_done,
+                       c->device_name );
 
-            /* Check for a fatal error. */
             if( r < 0 )
             {
+                free( c->prng_seed.s );
+                c->prng_seed.s = NULL;
                 return r;
             }
 
             if( c->verify_errors == 0 )
             {
-                nwipe_log( NWIPE_LOG_NOTICE, "[SUCCESS] Verified that %s is empty.", c->device_name );
+                nwipe_log( NWIPE_LOG_NOTICE,
+                           "[SUCCESS] Verified that %s is empty.",
+                           c->device_name );
             }
             else
             {
-                nwipe_log( NWIPE_LOG_NOTICE, "[FAILURE] %s Verification errors, not empty", c->device_name );
+                nwipe_log( NWIPE_LOG_NOTICE,
+                           "%s Verification errors, not empty",
+                           c->device_name );
             }
         }
 
         if( c->verify_errors == 0 && c->pass_errors == 0 )
         {
-            nwipe_log( NWIPE_LOG_NOTICE, "[SUCCESS] Blanked device %s", c->device_name );
+            nwipe_log( NWIPE_LOG_NOTICE,
+                       "[SUCCESS] Blanked device %s",
+                       c->device_name );
         }
         else
         {
-            nwipe_log( NWIPE_LOG_NOTICE, "[FAILURE] %s may not be blanked", c->device_name );
+            nwipe_log( NWIPE_LOG_NOTICE,
+                       "[FAILURE] %s may not be blanked",
+                       c->device_name );
         }
+    } /* final blank / verify handling */
 
-    } /* final blank */
-
-    /* Release the state buffer. */
+    /* Release the PRNG seed buffer before returning. */
     c->prng_seed.length = 0;
     free( c->prng_seed.s );
+    c->prng_seed.s = NULL;
 
-    /* Tell the parent that we have fininshed the final pass. */
+    /* Tell the parent that we have finished the final pass. */
     c->pass_type = NWIPE_PASS_NONE;
 
     if( c->verify_errors > 0 )
     {
-        /* We finished, but with non-fatal verification errors. */
-        nwipe_log( NWIPE_LOG_ERROR, "%llu verification errors on '%s'.", c->verify_errors, c->device_name );
+        /* Non-fatal verification mismatches encountered. */
+        nwipe_log( NWIPE_LOG_ERROR,
+                   "%llu verification errors on '%s'.",
+                   c->verify_errors,
+                   c->device_name );
     }
 
     if( c->pass_errors > 0 )
     {
-        /* We finished, but with non-fatal wipe errors. */
-        nwipe_log( NWIPE_LOG_ERROR, "%llu wipe errors on '%s'.", c->pass_errors, c->device_name );
+        /* Non-fatal write errors encountered. */
+        nwipe_log( NWIPE_LOG_ERROR,
+                   "%llu wipe errors on '%s'.",
+                   c->pass_errors,
+                   c->device_name );
     }
 
     /* FIXME: The 'round_errors' context member is not being used. */
 
     if( c->pass_errors > 0 || c->round_errors > 0 || c->verify_errors > 0 )
     {
-        /* We finished, but with non-fatal errors. */
+        /* Completed with non-fatal errors (caller sees "1"). */
         return 1;
     }
 
-    /* We finished successfully. */
+    /* Completed successfully with no non-fatal errors. */
     return 0;
+}
 
-} /* nwipe_runmethod */
 
 void calculate_round_size( nwipe_context_t* c )
 {

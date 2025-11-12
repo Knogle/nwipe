@@ -60,6 +60,9 @@
 #include "conf.h"
 #include <libconfig.h>
 
+#include <sys/socket.h>
+#include <linux/if_alg.h>
+
 int terminate_signal;
 int user_abort;
 int global_wipe_status;
@@ -99,6 +102,7 @@ int main( int argc, char** argv )
 
     /* The entropy source file handle. */
     int nwipe_entropy;
+    nwipe_entropy = -1;
 
     /* The generic index variables. */
     int i;
@@ -256,20 +260,89 @@ int main( int argc, char** argv )
         exit( 1 );
     }
 
-    /* Open the entropy source. */
-    nwipe_entropy = open( NWIPE_KNOB_ENTROPY, O_RDONLY );
-
-    /* Check the result. */
-    if( nwipe_entropy < 0 )
+    /* Try to open the entropy source via kernel RNG (AF_ALG). */
     {
-        nwipe_perror( errno, __FUNCTION__, "open" );
-        nwipe_log( NWIPE_LOG_FATAL, "Unable to open entropy source %s.", NWIPE_KNOB_ENTROPY );
-        cleanup();
-        free( c2 );
-        return errno;
+        int rng_sock;
+        struct sockaddr_alg sa;
+        unsigned char probe[8];
+
+        memset( &sa, 0, sizeof( sa ) );
+        sa.salg_family = AF_ALG;
+        /* AF_ALG type "rng" */
+        strncpy( (char *) sa.salg_type, "rng", sizeof( sa.salg_type ) - 1 );
+        /* Prefer a DRBG that seeds itself from the kernel */
+        strncpy( (char *) sa.salg_name, "drbg_nopr_sha256", sizeof( sa.salg_name ) - 1 );
+
+        rng_sock = socket( AF_ALG, SOCK_SEQPACKET, 0 );
+        if( rng_sock < 0 )
+        {
+            nwipe_perror( errno, __FUNCTION__, "socket(AF_ALG rng)" );
+            nwipe_log( NWIPE_LOG_WARNING,
+                       "AF_ALG RNG not available (socket failed), will try '%s' instead.",
+                       NWIPE_KNOB_ENTROPY );
+        }
+        else
+        {
+            if( bind( rng_sock, (struct sockaddr *) &sa, sizeof( sa ) ) < 0 )
+            {
+                nwipe_perror( errno, __FUNCTION__, "bind(AF_ALG rng:drbg_nopr_sha256)" );
+                nwipe_log( NWIPE_LOG_WARNING,
+                           "Unable to bind AF_ALG RNG socket, will use fallback entropy source." );
+                close( rng_sock );
+            }
+            else
+            {
+                /* Accept operation socket – this FD is used as entropy_fd. */
+                nwipe_entropy = accept( rng_sock, NULL, 0 );
+                if( nwipe_entropy < 0 )
+                {
+                    nwipe_perror( errno, __FUNCTION__, "accept(AF_ALG rng:drbg_nopr_sha256)" );
+                    nwipe_log( NWIPE_LOG_WARNING,
+                               "Unable to accept AF_ALG RNG socket, will use fallback entropy source." );
+                }
+                else
+                {
+                    /* Probe-read: small test to detect EINVAL / misconfigured RNG early. */
+                    ssize_t pr = read( nwipe_entropy, probe, sizeof( probe ) );
+                    if( pr != (ssize_t) sizeof( probe ) )
+                    {
+                        nwipe_perror( errno, __FUNCTION__, "read(AF_ALG rng probe)" );
+                        nwipe_log( NWIPE_LOG_WARNING,
+                                   "AF_ALG RNG probe read failed, will use fallback entropy source." );
+                        close( nwipe_entropy );
+                        nwipe_entropy = -1;
+                    }
+                    else
+                    {
+                        nwipe_log( NWIPE_LOG_NOTICE,
+                                   "Opened entropy source 'AF_ALG rng:drbg_nopr_sha256'." );
+                    }
+                }
+
+                /* Parent (transformation) socket is no longer needed. */
+                close( rng_sock );
+            }
+        }
     }
 
-    nwipe_log( NWIPE_LOG_NOTICE, "Opened entropy source '%s'.", NWIPE_KNOB_ENTROPY );
+    /* Fallback: if AF_ALG RNG could not be opened or probe failed, use /dev/urandom. */
+    if( nwipe_entropy < 0 )
+    {
+        nwipe_entropy = open( NWIPE_KNOB_ENTROPY, O_RDONLY );
+        if( nwipe_entropy < 0 )
+        {
+            nwipe_perror( errno, __FUNCTION__, "open entropy source" );
+            nwipe_log( NWIPE_LOG_FATAL,
+                       "Unable to open entropy source %s.", NWIPE_KNOB_ENTROPY );
+            cleanup();
+            free( c2 );
+            return errno;
+        }
+
+        nwipe_log( NWIPE_LOG_NOTICE,
+                   "Opened entropy source '%s'.",
+                   NWIPE_KNOB_ENTROPY );
+    }
 
     /* Block relevant signals in main thread. Any other threads that are     */
     /*        created after this will also block those signals.              */
