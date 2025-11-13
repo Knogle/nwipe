@@ -39,6 +39,9 @@
  */
 
 #include <stdint.h>
+#ifdef __linux__
+#include <sys/random.h>
+#endif
 
 #include "nwipe.h"
 #include "context.h"
@@ -47,6 +50,54 @@
 #include "options.h"
 #include "pass.h"
 #include "logging.h"
+
+/* Fill a buffer with cryptographic entropy.
+ * - unter Linux: getrandom()
+ * - sonst: Fallback auf c->entropy_fd (altes Verhalten)
+ */
+static int nwipe_fill_entropy( nwipe_context_t* c, void* buffer, size_t length )
+{
+#if defined( __linux__ )
+    size_t done = 0;
+
+    while( done < length )
+    {
+        ssize_t r = getrandom( (unsigned char*) buffer + done, length - done, 0 );
+        if( r < 0 )
+        {
+            if( errno == EINTR )
+            {
+                continue;  // nochmals versuchen
+            }
+            return -1;  // errno bleibt gesetzt
+        }
+
+        if( r == 0 )
+        {
+            // Sollte eigentlich nicht passieren; schadet nicht, es defensiv zu behandeln
+            errno = EIO;
+            return -1;
+        }
+
+        done += (size_t) r;
+    }
+
+    return 0;
+#else
+    // Fallback: altes Verhalten mit entropy_fd
+    ssize_t r = read( c->entropy_fd, buffer, length );
+    if( r < 0 )
+    {
+        return -1;
+    }
+    if( (size_t) r != length )
+    {
+        errno = EIO;
+        return -1;
+    }
+    return 0;
+#endif
+}
 
 /*
  * Comment Legend
@@ -292,29 +343,26 @@ void* nwipe_dod522022m( void* ptr )
                                    { 0, NULL } };
 
     /* Load the array with random characters. */
-    r = read( c->entropy_fd, &dod, sizeof( dod ) );
-
-    /* NOTE: Only the random data in dod[0], dod[3], and dod[4] is actually used. */
-
-    /* Check the result. */
-    if( r != sizeof( dod ) )
+    if( nwipe_fill_entropy( c, &dod, sizeof( dod ) ) < 0 )
     {
-        r = errno;
-        nwipe_perror( r, __FUNCTION__, "read" );
+        int err = errno;
+        nwipe_perror( err, __FUNCTION__, "getrandom" );
         nwipe_log( NWIPE_LOG_FATAL, "Unable to seed the %s method.", nwipe_dod522022m_label );
 
-        /* Ensure a negative return. */
-        if( r < 0 )
+        /* Ensure a negative return, wie vorher auch */
+        if( err < 0 )
         {
-            c->result = r;
-            return NULL;
+            c->result = err;
         }
         else
         {
             c->result = -1;
-            return NULL;
         }
+
+        return NULL;  // analog zu deinem bisherigen Fehlerpfad
     }
+
+    /* NOTE: Only the random data in dod[0], dod[3], and dod[4] is actually used. */
 
     /* Pass 2 is the bitwise complement of Pass 1. */
     dod[1] = ~dod[0];
@@ -1000,25 +1048,19 @@ int nwipe_runmethod( nwipe_context_t* c, nwipe_pattern_t* patterns )
             {
                 c->pass_type = NWIPE_PASS_WRITE;
 
-                /* Seed the PRNG. */
-                r = read( c->entropy_fd, c->prng_seed.s, c->prng_seed.length );
-
-                /* Check the result. */
-                if( r < 0 )
+                /* Seed the PRNG (per getrandom()). */
+                if( nwipe_fill_entropy( c, c->prng_seed.s, c->prng_seed.length ) < 0 )
                 {
+                    int err = errno;
                     c->pass_type = NWIPE_PASS_NONE;
-                    nwipe_perror( errno, __FUNCTION__, "read" );
+                    nwipe_perror( err, __FUNCTION__, "getrandom" );
                     nwipe_log( NWIPE_LOG_FATAL, "Unable to seed the PRNG." );
                     return -1;
                 }
 
-                /* Check for a partial read. */
-                if( r != c->prng_seed.length )
-                {
-                    /* TODO: Handle partial reads. */
-                    nwipe_log( NWIPE_LOG_FATAL, "Insufficient entropy is available." );
-                    return -1;
-                }
+                /* kein Partial-Read-Check mehr nötig, nwipe_fill_entropy() garantiert
+                 * entweder volle Befüllung oder Fehler
+                 */
 
                 /* Write the random pass. */
                 r = nwipe_random_pass( c );
@@ -1103,24 +1145,16 @@ int nwipe_runmethod( nwipe_context_t* c, nwipe_pattern_t* patterns )
         /* Tell the parent that we are running the final pass. */
         c->pass_type = NWIPE_PASS_FINAL_OPS2;
 
-        /* Seed the PRNG. */
-        r = read( c->entropy_fd, c->prng_seed.s, c->prng_seed.length );
-
-        /* Check the result. */
-        if( r < 0 )
+        /* Seed the PRNG (per getrandom()). */
+        if( nwipe_fill_entropy( c, c->prng_seed.s, c->prng_seed.length ) < 0 )
         {
-            nwipe_perror( errno, __FUNCTION__, "read" );
+            int err = errno;
+            nwipe_perror( err, __FUNCTION__, "getrandom" );
             nwipe_log( NWIPE_LOG_FATAL, "Unable to seed the PRNG." );
             return -1;
         }
 
-        /* Check for a partial read. */
-        if( r != c->prng_seed.length )
-        {
-            /* TODO: Handle partial reads. */
-            nwipe_log( NWIPE_LOG_FATAL, "Insufficient entropy is available." );
-            return -1;
-        }
+        /* Partial-Read-Check entfällt, siehe oben */
 
         nwipe_log( NWIPE_LOG_NOTICE, "Writing final random pattern to '%s'.", c->device_name );
 
